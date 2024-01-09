@@ -9,7 +9,7 @@ before:
 builds:
   - id: "inch"
     binary: inch
-    main: .
+    main: ./cmd/inch
     goos:
       - linux
       - darwin
