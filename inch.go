@@ -68,7 +68,7 @@ type Simulator struct {
 	writeClient *http.Client
 
 	// Function for writing batches of points.
-	WriteBatch func(s *Simulator, buf []byte) (statusCode int, body io.ReadCloser, err error)
+	WriteBatch func(s *Simulator, i int, buf []byte) (statusCode int, body io.ReadCloser, err error)
 
 	// Decay factor used when weighting average latency returned by server.
 	alpha          float64
@@ -82,25 +82,30 @@ type Simulator struct {
 	DryRun         bool
 	MaxErrors      int
 
-	Host             string
-	User             string
-	Password         string
-	Consistency      string
-	Concurrency      int
-	Measurements     int    // Number of measurements
-	Tags             []int  // tag cardinalities
-	VHosts           uint64 // Simulate multiple virtual hosts
-	PointsPerSeries  int
-	FieldsPerPoint   int
-	RandomizeFields  bool
-	OneFieldPerLine  bool
-	WritesPerPoint   int
-	FieldPrefix      string
-	BatchSize        int
-	TargetMaxLatency time.Duration
-	Gzip             bool
+	Host                 string
+	Hosts                []string
+	User                 string
+	Password             string
+	Consistency          string
+	Concurrency          int
+	Measurements         int    // Number of measurements
+	MstPrefix            string // measurement name prefix
+	Tags                 []int  // tag cardinalities
+	ExtraTagsRelations   []int  // [10, 100, 1] -> 1/10, 1/100, 1 -> Tags/10, Tags/100, Tags/1
+	ExtraTagsCardinality []int  // extra tag cardinalities
+	VHosts               uint64 // Simulate multiple virtual hosts
+	PointsPerSeries      int
+	FieldsPerPoint       int
+	RandomizeFields      bool
+	OneFieldPerLine      bool
+	WritesPerPoint       int
+	FieldPrefix          string
+	BatchSize            int
+	TargetMaxLatency     time.Duration
+	Gzip                 bool
 
 	Database      string
+	Retention     string
 	ShardDuration string        // Set a custom shard duration.
 	StartTime     string        // Set a custom start time.
 	TimeSpan      time.Duration // The length of time to span writes over.
@@ -193,6 +198,7 @@ func (s *Simulator) Run(ctx context.Context) error {
 
 	// Print settings.
 	fmt.Fprintf(s.Stdout, "Host: %s\n", s.Host)
+	fmt.Fprintf(s.Stdout, "Hosts: %s\n", strings.Join(s.Hosts, ","))
 	fmt.Fprintf(s.Stdout, "Concurrency: %d\n", s.Concurrency)
 	fmt.Fprintf(s.Stdout, "Virtual Hosts: %d\n", s.VHosts)
 	fmt.Fprintf(s.Stdout, "Measurements: %d\n", s.Measurements)
@@ -268,7 +274,7 @@ func (s *Simulator) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < s.Concurrency; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); s.runClient(ctx, ch) }()
+		go func(i int) { defer wg.Done(); s.runClient(ctx, i, ch) }(i)
 	}
 
 	// Start monitor.
@@ -342,6 +348,7 @@ func (s *Simulator) generateBatches() <-chan []byte {
 
 	go func() {
 		values := make([]int, len(s.Tags))
+		extraValues := make([]int, len(s.ExtraTagsCardinality)) // [10]
 		lastWrittenTotal := s.WrittenN()
 
 		// Generate field strings
@@ -359,7 +366,8 @@ func (s *Simulator) generateBatches() <-chan []byte {
 
 		// Write points.
 		var lastMN int
-		lastM := []byte("m0")
+		lastM := []byte(fmt.Sprintf("%s0", s.MstPrefix))
+		lenM := len(lastM)
 		fieldRandomize := rand.New(rand.NewSource(1234))
 		var tags []byte
 
@@ -370,10 +378,16 @@ func (s *Simulator) generateBatches() <-chan []byte {
 
 		for i := 0; i < s.PointN(); i++ {
 			lastMN = i % s.Measurements
-			lastM = append(lastM[:1], []byte(strconv.Itoa(lastMN))...)
+			lastM = append(lastM[:lenM-1], []byte(strconv.Itoa(lastMN))...)
 			tags = tags[:0] // Reset slice but use backing array.
 			for j, value := range values {
 				tags = append(tags, fmt.Sprintf(",tag%d=value%d", j, value)...)
+			}
+
+			if len(s.ExtraTagsCardinality) > 0 {
+				for j, value := range extraValues {
+					tags = append(tags, fmt.Sprintf(",tag%d=value%d", j+len(values), value)...)
+				}
 			}
 
 			fieldValueIndex := 0
@@ -397,15 +411,20 @@ func (s *Simulator) generateBatches() <-chan []byte {
 			}
 
 			// Increment next tag value.
-			for i := range values {
-				values[i]++
-				if values[i] < s.Tags[i] {
+			for m := range values {
+				values[m]++
+				if values[m] < s.Tags[m] {
 					break
 				} else {
-					values[i] = 0 // reset to zero, increment next value
+					values[m] = 0 // reset to zero, increment next value
 					continue
 				}
 			}
+
+			for k := range extraValues {
+				extraValues[k] = values[s.ExtraTagsRelations[k]] / s.ExtraTagsCardinality[k]
+			}
+
 			// Start new batch, if necessary.
 			if i > 0 && i%s.BatchSize == 0 {
 				ch <- copyBytes(buf.Bytes())
@@ -607,7 +626,7 @@ func (s *Simulator) quartileResponse(q float64) time.Duration {
 }
 
 // runClient executes a client to send points in a separate goroutine.
-func (s *Simulator) runClient(ctx context.Context, ch <-chan []byte) {
+func (s *Simulator) runClient(ctx context.Context, i int, ch <-chan []byte) {
 	b := bytes.NewBuffer(make([]byte, 0, 1024))
 	g := gzip.NewWriter(b)
 
@@ -649,7 +668,7 @@ func (s *Simulator) runClient(ctx context.Context, ch <-chan []byte) {
 					}
 				}
 
-				if err := s.sendBatch(b.Bytes()); err == ErrConnectionRefused {
+				if err := s.sendBatch(i, b.Bytes()); err == ErrConnectionRefused {
 					return
 				} else if err != nil {
 					fmt.Fprintln(s.Stderr, err)
@@ -727,8 +746,14 @@ var defaultSetupFn = func(s *Simulator) error {
 
 // defaultWriteBatch is the default implementation of the WriteBatch function.
 // It's the caller's responsibility to close the response body.
-var defaultWriteBatch = func(s *Simulator, buf []byte) (statusCode int, body io.ReadCloser, err error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/write?db=%s&precision=ns&consistency=%s", s.Host, s.Database, s.Consistency), bytes.NewReader(buf))
+var defaultWriteBatch = func(s *Simulator, i int, buf []byte) (statusCode int, body io.ReadCloser, err error) {
+	writeHost := s.Host
+	if len(s.Hosts) > 0 {
+		index := i % len(s.Hosts)
+		writeHost = s.Hosts[index]
+	}
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/write?db=%s&rp=%s&precision=ns&consistency=%s", writeHost, s.Database, s.Retention, s.Consistency), bytes.NewReader(buf))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -764,7 +789,7 @@ var defaultWriteBatch = func(s *Simulator, buf []byte) (statusCode int, body io.
 }
 
 // sendBatch writes a batch to the server. Continually retries until successful.
-func (s *Simulator) sendBatch(buf []byte) error {
+func (s *Simulator) sendBatch(idx int, buf []byte) error {
 	// Don't send the batch anywhere..
 	if s.DryRun {
 		return nil
@@ -772,7 +797,7 @@ func (s *Simulator) sendBatch(buf []byte) error {
 
 	// Send batch.
 	now := time.Now().UTC()
-	code, bodyreader, err := s.WriteBatch(s, buf)
+	code, bodyreader, err := s.WriteBatch(s, idx, buf)
 	if err != nil {
 		return err
 	}
