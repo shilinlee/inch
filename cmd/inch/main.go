@@ -69,13 +69,16 @@ func (m *Main) ParseFlags(args []string) error {
 	fs.BoolVar(&m.inch.DryRun, "dry", false, "Dry run (maximum writer perf of inch on box)")
 	fs.IntVar(&m.inch.MaxErrors, "max-errors", 0, "Terminate process if this many errors encountered")
 	fs.StringVar(&m.inch.Host, "host", "http://localhost:8086", "Host")
+	hosts := fs.String("hosts", "", "Hosts, like: http://127.0.0.1:8086,http://127.0.0.2:8086")
 	fs.StringVar(&m.inch.User, "user", "", "Host User")
 	fs.StringVar(&m.inch.Password, "password", "", "Host Password")
 	fs.StringVar(&m.inch.Consistency, "consistency", "any", "Write consistency (default any)")
 	fs.IntVar(&m.inch.Concurrency, "c", 1, "Concurrency")
 	fs.Uint64Var(&m.inch.VHosts, "vhosts", 0, "Virtual Hosts")
 	fs.IntVar(&m.inch.Measurements, "m", 1, "Measurements")
+	fs.StringVar(&m.inch.MstPrefix, "mst-prefix", "m", "The measurement prefix")
 	tags := fs.String("t", "10,10,10", "Tag cardinality")
+	eTags := fs.String("extra-tags", "", "Relationship between the exact tag and multiple. 0:10,1:100,0:5. There are 3 tags. 1/10 of the first tag, 1/100 of the second tag,  1/5 of the first tag.")
 	fs.IntVar(&m.inch.PointsPerSeries, "p", 100, "Points per series")
 	fs.StringVar(&m.inch.FieldPrefix, "field-prefix", "v0", "Field key prefix")
 	fs.IntVar(&m.inch.FieldsPerPoint, "f", 1, "Fields per point")
@@ -83,7 +86,8 @@ func (m *Main) ParseFlags(args []string) error {
 	fs.BoolVar(&m.inch.OneFieldPerLine, "one-field-per-line", false, "One line of line protocol per field instead of one line per point")
 	fs.IntVar(&m.inch.BatchSize, "b", 5000, "Batch size")
 	fs.StringVar(&m.inch.Database, "db", "stress", "Database to write to")
-	fs.StringVar(&m.inch.ShardDuration, "shard-duration", "7d", "Set shard duration (default 7d)")
+	fs.StringVar(&m.inch.Retention, "rp", "autogen", "Retention policy to write to")
+	fs.StringVar(&m.inch.ShardDuration, "shard-duration", "7d", "Set shard duration")
 	fs.StringVar(&m.inch.StartTime, "start-time", "", "Set start time (default now)")
 	fs.DurationVar(&m.inch.TimeSpan, "time", 0, "Time span to spread writes over")
 	fs.DurationVar(&m.inch.Delay, "delay", 0, "Delay between writes")
@@ -107,6 +111,46 @@ func (m *Main) ParseFlags(args []string) error {
 			return fmt.Errorf("cannot parse tag cardinality: %s", s)
 		}
 		m.inch.Tags = append(m.inch.Tags, v)
+	}
+
+	// Parse tag cardinalities.
+	m.inch.ExtraTagsRelations = make([]int, 0)
+	m.inch.ExtraTagsCardinality = make([]int, 0)
+	for _, s := range strings.Split(*eTags, ",") {
+		if s == "" {
+			continue
+		}
+
+		kv := strings.Split(s, ":")
+		if len(kv) != 2 {
+			return fmt.Errorf("cannot parse extra tags: %s. Your should write like the 0:10,1:100", s)
+		}
+
+		k, err := strconv.Atoi(kv[0])
+		if err != nil {
+			return fmt.Errorf("cannot parse extra tags: %s. Your should write like the 0:10,1:100", s)
+		}
+
+		if k >= len(m.inch.Tags) {
+			return fmt.Errorf("the num befor : should be the index of -t params: %s", s)
+		}
+
+		v, err := strconv.Atoi(kv[1])
+		if err != nil {
+			return fmt.Errorf("cannot parse extra tags: %s. Your should write like the 0:10,1:100", s)
+		}
+
+		if v <= 0 || v > m.inch.Tags[k] {
+			return fmt.Errorf("the num after : should less than the right index of -t params: %s", s)
+		}
+
+		//m.inch.TagsRelations[k] = v
+		m.inch.ExtraTagsRelations = append(m.inch.ExtraTagsRelations, k)
+		m.inch.ExtraTagsCardinality = append(m.inch.ExtraTagsCardinality, v)
+	}
+
+	for _, h := range strings.Split(*hosts, ",") {
+		m.inch.Hosts = append(m.inch.Hosts, h)
 	}
 
 	// Basic report tags.
